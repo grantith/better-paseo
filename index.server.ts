@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { open, stat, type FileHandle } from "node:fs/promises";
-import { isAbsolute, join, resolve } from "node:path";
+import { join } from "node:path";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { updateCheckRpc } from "./shared/update-check";
 import { openTerminalRpc, updateCommand } from "./shared/open-terminal";
@@ -20,6 +20,7 @@ import { writePerfDump } from "./server/perf-dump";
 import { registerTasksServer } from "./server/tasks/register";
 import { registerTurnUsageServer } from "./server/turn-usage";
 import { shellOpenCommand, type PathEntry } from "./server/open-path";
+import { resolveLocalPath } from "./server/local-path";
 
 /**
  * Image types worth inlining, and the mime each one needs in its data URI.
@@ -99,32 +100,6 @@ function readImageSize(bytes: Buffer, kind: string): { width: number; height: nu
   return null;
 }
 
-/** Strips the selector a tool appends to a path, such as `main.ts:55-85`. */
-function stripSelector(path: string): string {
-  const trimmed = path.trim();
-  const windowsDrive = /^[a-zA-Z]:[\\/]/.test(trimmed);
-  const head = windowsDrive ? trimmed.slice(0, 3) : "";
-  const tail = windowsDrive ? trimmed.slice(3) : trimmed;
-  const cut = tail.search(/[\s:?#]/);
-  return cut === -1 ? trimmed : head + tail.slice(0, cut);
-}
-
-/**
- * `stripSelector`, unless the whole string names a file: a path with a space,
- * `#` or `:` in it (`My Shots/a.png`) is a real name, not a path plus selector.
- */
-async function resolveSelector(path: string, cwd: string): Promise<string> {
-  const whole = path.trim();
-  if (whole) {
-    try {
-      await stat(isAbsolute(whole) ? whole : resolve(cwd, whole));
-      return whole;
-    } catch {
-      // Not a file as written; fall back to cutting the selector.
-    }
-  }
-  return stripSelector(path);
-}
 
 /** Runs the path press's shell command (`shellOpenCommand`), detached. */
 function openWithShell(target: string, entry: PathEntry): void {
@@ -475,11 +450,9 @@ export default function contribute(server: PluginServerContext) {
   registerTurnUsageServer(server);
 
   server.handle(revealPathRpc, async (input) => {
-    const requested = await resolveSelector(input.path, input.cwd);
-    if (!requested) return { revealed: null, error: "No path" };
-
-    const target = isAbsolute(requested) ? requested : resolve(input.cwd, requested);
     try {
+      const target = await resolveLocalPath(input.path, input.cwd);
+      if (!target) return { revealed: null, error: "No path" };
       const entry = await stat(target);
       openWithShell(target, entry);
       return { revealed: target, error: null };
@@ -493,16 +466,13 @@ export default function contribute(server: PluginServerContext) {
 
   server.handle(imageRpc, async (input) => {
     const empty = { dataUri: null, mime: null, width: null, height: null, bytes: null };
-    const requested = await resolveSelector(input.path, input.cwd);
-    if (!requested) return { ...empty, error: "No path" };
-
-    const kind = requested.slice(requested.lastIndexOf(".") + 1).toLowerCase();
-    const mime = IMAGE_MIMES[kind];
-    if (!mime) return { ...empty, error: `Not an image: .${kind}` };
-
-    const target = isAbsolute(requested) ? requested : resolve(input.cwd, requested);
     let handle: FileHandle | null = null;
     try {
+      const target = await resolveLocalPath(input.path, input.cwd);
+      if (!target) return { ...empty, error: "No path" };
+      const kind = target.slice(target.lastIndexOf(".") + 1).toLowerCase();
+      const mime = IMAGE_MIMES[kind];
+      if (!mime) return { ...empty, error: `Not an image: .${kind}` };
       const entry = await stat(target);
       if (!entry.isFile()) return { ...empty, error: "Not a file" };
 
